@@ -26,33 +26,21 @@ from scrapely.extraction.regionextract import (
 from scrapely.extraction.similarity import (
     similar_region, longest_unique_subsequence, first_longest_subsequence
 )
-from scrapely.htmlpage import HtmlTagType, HtmlPageParsedRegion, HtmlPageRegion
+from scrapely.htmlpage import HtmlTagType
 from scrapy.utils.spider import arg_to_iter
-from slybot.fieldtypes import FieldTypeManager
-from slybot.item import SlybotFieldDescriptor
 
-from w3lib.html import remove_tags
-
-
-def _compose(f, g):
-    """given unary functions f and g, return a function that computes f(g(x))
-    """
-    def _exec(x):
-        ret = g(x)
-        if ret is not None:
-            ret = HtmlPageRegion(ret.htmlpage, remove_tags(ret.text_content))
-            return f(ret)
-        return None
-    return _exec
+from .processors import MissingRequiredError, ItemProcessor
 
 
 MAX_SEARCH_DISTANCE_MULTIPLIER = 3
 MIN_TOKEN_LENGTH_BEFORE_TRUNCATE = 3
 MIN_JUMP_DISTANCE = 0.7
 MAX_RELATIVE_SEPARATOR_MULTIPLIER = 0.7
-_DEFAULT_EXTRACTOR = FieldTypeManager().type_processor_class('raw html')()
 Region = namedtuple('Region', ['score', 'start_index', 'end_index'])
-container_id = lambda x: x.annotation.metadata.get('container_id')
+
+
+def container_id(x):
+    return x.annotation.metadata.get('container_id')
 
 
 def _int_cmp(a, op, b):
@@ -60,9 +48,6 @@ def _int_cmp(a, op, b):
     a = -float('inf') if a is None else a
     b = -float('inf') if b is None else b
     return op(a, b)
-
-class MissingRequiredError(Exception):
-    pass
 
 
 def group_tree(tree, container_annotations):
@@ -436,13 +421,10 @@ class BaseContainerExtractor(object):
                 return annotation
 
     def _validate_and_adapt_item(self, item, htmlpage):
-        """
-        Look at item extracted by this container and make sure that all
-        required fields are extracted, adapted and fields are renamed if
-        necessary.
-        """
-        if u'_type' in item:
+        if isinstance(item, ItemProcessor):
             return item
+
+        # Check if all required fields are available
         if isinstance(item, dict):
             for k in self.extra_requires:
                 if k.startswith('_sticky'):  # Sticky no longer supported
@@ -450,102 +432,22 @@ class BaseContainerExtractor(object):
                     continue
                 if k not in item:
                     return {}
-        new_item = defaultdict(list)
-        if isinstance(item, dict):
-            item = item.items()
-        elif item and not isinstance(item[0], (tuple, dict)):
-            item = [item]
-        item_fields = (list(i.items()) if hasattr(i, 'items') else (i,)
-                       for i in item)
-        for k, v in chain(*item_fields):
-            if hasattr(k, 'startswith'):
-                if k.startswith('_'):
-                    new_item[k] = v
-                    continue
-                elif k.startswith('#'):
-                    continue
-            try:
-                for k, v in self._process_fields(k, v, htmlpage):
-                    new_item[k].extend(v)
-            except MissingRequiredError:
-                return {}
-        new_item_fields = {getattr(f, 'name', f): v
-                           for f, v in new_item.items() if v}
-        new_item = {getattr(f, 'description', f): v
-                    for f, v in new_item.items() if v}
-        _type = getattr(self.schema, 'description', None)
-        if (hasattr(self.schema, '_item_validates') and
-                not self.schema._item_validates(new_item_fields)):
-            return {}
-        merged_item = defaultdict(list)
-        for f, v in new_item.items():
-            fieldname = getattr(f, 'description', f)
-            try:
-                assert not fieldname.startswith('_')
-                merged_item[fieldname] += v
-            except (TypeError, AssertionError):
-                merged_item[fieldname] = v
-        if _type:
-            merged_item[u'_type'] = _type
-        return dict(merged_item)
+        annotations = [e.annotation for e in getattr(self, 'extractors', [])]
+        try:
+            annotation = self.annotation
+        except AttributeError:
+            annotation = AnnotationTag(1, 1)
+        # TODO: Pass item region
+        item = ItemProcessor(
+            annotation, '111', item, htmlpage=htmlpage, schema=self.schema,
+            annotations=annotations, modifiers=self.modifiers)
 
-    def _process_fields(self, annotations, regions, htmlpage):
-        for annotation in arg_to_iter(annotations):
-            if isinstance(annotation, dict):
-                field = annotation['field']
-                try:
-                    field_extraction = self.schema.attribute_map.get(field)
-                except AttributeError:
-                    field_extraction = None
-                if field_extraction is None:
-                    field_extraction = SlybotFieldDescriptor(
-                        field, field, _DEFAULT_EXTRACTOR)
-                if annotation.get('pre_text') or annotation.get('post_text'):
-                    text_extractor = TextRegionDataExtractor(
-                        annotation.get('pre_text', ''),
-                        annotation.get('post_text', ''))
-                    field_extraction = copy.deepcopy(field_extraction)
-                    field_extraction.extractor = _compose(
-                        field_extraction.extractor, text_extractor.extract)
-                extracted = self._process_values(
-                    regions, htmlpage, field_extraction
-                )
-                for extractor in annotation.get('extractors', []):
-                    custom_extractor_func = self.modifiers.get(extractor)
-                    if custom_extractor_func and extracted:
-                        extracted = [custom_extractor_func(s, htmlpage)
-                                     for s in extracted]
-                if annotation.get('required') and not extracted:
-                    raise MissingRequiredError()
-                yield (field_extraction, extracted)
-            else:
-                try:
-                    extraction_func = self.schema.attribute_map.get(annotation)
-                except AttributeError:
-                    extraction_func = None
-                if extraction_func is None:
-                    extraction_func = SlybotFieldDescriptor(
-                        annotation, annotation, _DEFAULT_EXTRACTOR)
-                values = self._process_values(regions, htmlpage,
-                                              extraction_func)
-                yield (extraction_func, values)
-
-    def _process_values(self, regions, htmlpage, extraction_func):
-        values = []
-        for value in arg_to_iter(regions):
-            if (isinstance(value, (HtmlPageParsedRegion, HtmlPageRegion)) and
-                    hasattr(extraction_func, 'extractor')):
-                value = extraction_func.extractor(value)
-            if value:
-                values.append(value)
-        if hasattr(extraction_func, 'adapt'):
-            if hasattr(htmlpage, 'htmlpage'):
-                htmlpage = htmlpage.htmlpage
-            values = [extraction_func.adapt(x, htmlpage) for x in values
-                      if x and not isinstance(x, dict)]
+        # Check if item is valid
+        dumped = item.dump()
+        if dumped:
+            return item
         else:
-            values = list(filter(bool, values))
-        return values
+            return {}
 
     def __str__(self):
         stream = StringIO()
@@ -637,7 +539,7 @@ class ContainerExtractor(BaseContainerExtractor, BasicTypeExtractor):
                 return []
             if (isinstance(extractor, RepeatedContainerExtractor) or
                     isinstance(item, list)):
-                if item and isinstance(item[0], dict):
+                if item and isinstance(item[0], ItemProcessor):
                     items.extend(item)
                 else:
                     items.append(item)
@@ -646,17 +548,12 @@ class ContainerExtractor(BaseContainerExtractor, BasicTypeExtractor):
         return items
 
     def _merge_items(self, items):
-        result = defaultdict(list)
-        for item in items:
-            if hasattr(item, 'items'):
-                item = item.items()
-            for k, v in item:
-                if isinstance(v, list):
-                    result[k].extend(v)
-                else:
-                    # Overwrites different item types
-                    result[k] = v
-        return [dict(result)]
+        if not items:
+            return []
+        item = items[0]
+        for other_item in items[1:]:
+            item.merge(other_item)
+        return item
 
 
 class RepeatedContainerExtractor(BaseContainerExtractor, RecordExtractor):
@@ -838,6 +735,7 @@ class RepeatedContainerExtractor(BaseContainerExtractor, RecordExtractor):
         """
         if len(prefix) <= min_prefix_len:
             return prefix
+        page_tokens = template.page_tokens
         new_prefix = copy.copy(prefix)
         suffixlen = len(suffix)
         end_index = self.annotation.end_index
@@ -845,17 +743,16 @@ class RepeatedContainerExtractor(BaseContainerExtractor, RecordExtractor):
         annotation_length = start_index - end_index
         max_start_index = min(
             start_index + MAX_SEARCH_DISTANCE_MULTIPLIER * annotation_length,
-            len(template.page_tokens))
+            len(page_tokens))
         while len(new_prefix) > min_prefix_len:
             index = end_index
             while index < max_start_index:
                 prefixlen = len(new_prefix)
                 prefix_end = index + prefixlen
-                if (template.page_tokens[index:prefix_end]
-                        == new_prefix).all():
+                if (page_tokens[index:prefix_end] == new_prefix).all():
                     for peek in xrange(prefix_end, max_start_index + 1):
-                        if (template.page_tokens[peek:peek + suffixlen]
-                                == suffix).all():
+                        suffix_tokens = page_tokens[peek:peek + suffixlen]
+                        if (suffix_tokens == suffix).all():
                             return new_prefix
                 index += 1
             if remove_from_end:
@@ -922,11 +819,11 @@ class TemplatePageMultiItemExtractor(TemplatePageExtractor):
         for extractor in self.extractors:
             extracted = extractor.extract(page, start_index, end_index,
                                           self.template.ignored_regions)
-            for item in extracted:
+            for item in arg_to_iter(extracted):
                 if item:
-                    if isinstance(item, dict):
+                    if isinstance(item, (ItemProcessor, dict)):
                         item[u'_template'] = self.template.id
-            items.extend(filter(bool, extracted))
+            items.extend(filter(bool, arg_to_iter(extracted)))
         return items
 
 
@@ -1003,7 +900,8 @@ class SlybotIBLExtractor(InstanceBasedLearningExtractor):
             extracted = extraction_tree.extract(extraction_page)
             correctly_extracted = []
             for item in extracted:
-                if u'_type' in item or not hasattr(self, 'validated'):
+                if (isinstance(item, ItemProcessor) or
+                        not hasattr(self, 'validated')):
                     correctly_extracted.append(item)
                 else:
                     validated = self.validated[template_id]([item])

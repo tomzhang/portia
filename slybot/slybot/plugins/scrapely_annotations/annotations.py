@@ -117,7 +117,7 @@ class Annotations(object):
 
     def handle_html(self, response, seen=None):
         htmlpage = htmlpage_from_response(response)
-        items, link_regions = self.extract_items(htmlpage)
+        items, link_regions = self.extract_items(htmlpage, response)
         htmlpage.headers['n_items'] = len(items)
         try:
             response.meta['n_items'] = len(items)
@@ -128,30 +128,27 @@ class Annotations(object):
         for request in self._process_link_regions(htmlpage, link_regions):
             yield request
 
-    def extract_items(self, htmlpage):
+    def extract_items(self, htmlpage, response=None):
         """This method is also called from UI webservice to extract items"""
         for extractor in self.extractors:
-            items, links = self._do_extract_items_from(htmlpage, extractor)
+            items, links = self._do_extract_items_from(htmlpage, extractor,
+                                                       response)
             if items:
                 return items, links
         return [], []
 
-    def _do_extract_items_from(self, htmlpage, extractor):
+    def _do_extract_items_from(self, htmlpage, extractor, response=None):
         # Try to predict template to use
-        pref_template_id = None
-        template_cluster = _CLUSTER_NA
-        if self.clustering:
-            self.clustering.add_page(htmlpage)
-            if self.clustering.is_fit:
-                clt = self.clustering.classify(htmlpage)
-                if clt != -1:
-                    template_cluster = self.template_names[clt]
-                    pref_template_id = template_cluster
-                else:
-                    template_cluster = _CLUSTER_OUTLIER
+        template_cluster, pref_template_id = self._cluster_page(htmlpage)
         extracted_data, template = extractor.extract(htmlpage, pref_template_id)
+        extracted = []
+        for item in arg_to_iter(extracted_data):
+            try:
+                extracted.append(item.process())
+            except AttributeError:
+                extracted.append(item)
         link_regions = []
-        for ddict in extracted_data or []:
+        for ddict in extracted or []:
             link_regions.extend(arg_to_iter(ddict.pop("_links", [])))
         descriptor = None
         unprocessed = False
@@ -174,7 +171,7 @@ class Annotations(object):
                 item_cls_name = sorted(self.template_scrapes.items())[0][1]
         item_cls = self.item_classes.get(item_cls_name)
         items = []
-        for processed_attributes in extracted_data or []:
+        for processed_attributes in extracted:
             if processed_attributes.get('_type') in self.item_classes:
                 _type = processed_attributes['_type']
                 item = self.item_classes[_type](processed_attributes)
@@ -188,8 +185,8 @@ class Annotations(object):
                 item = item_cls(processed_attributes)
             else:
                 item = dict(processed_attributes)
-            item['url'] = htmlpage.url
-            item['_template'] = str(template.id)
+            item[u'url'] = htmlpage.url
+            item[u'_template'] = str(template.id)
             item.setdefault('_type', item_cls_name)
             if not isinstance(item, SlybotItem):
                 default_meta = {'type': 'text', 'required': False,
@@ -243,6 +240,18 @@ class Annotations(object):
                 url_filterf = lambda x: pattern_fn(x.url)
 
         self.url_filterf = url_filterf
+
+    def _cluster_page(self, htmlpage):
+        template_cluster, preferred = _CLUSTER_NA, None
+        if self.clustering:
+            self.clustering.add_page(htmlpage)
+            if self.clustering.is_fit:
+                clt = self.clustering.classify(htmlpage)
+                if clt != -1:
+                    template_cluster = preferred = self.template_names[clt]
+                else:
+                    template_cluster = _CLUSTER_OUTLIER
+        return template_cluster, preferred
 
 
     def _filter_link(self, link, seen):
